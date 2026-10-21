@@ -1,0 +1,148 @@
+[hidden]{
+  display:none!important;
+}
+
+.columns-wrapper {
+  display: flex;
+  padding: 10px;
+}
+
+.windowContainer {
+  display: flex;
+  flex: 1;
+  /*  justify-content: center; */
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.windowContainer > * {
+  width: 100%;
+  margin-bottom: 10px;
+  box-sizing: border-box;
+}
+
+.js-select {
+  font-family: OpenSans-Bold, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 12px;
+  height: 39px;
+  line-height: 37px;
+  text-transform: uppercase;
+  background-color: #fff;
+  border-radius: 2px;
+  border: 1px solid #c6cdd3;
+  color: rgb(83, 91, 105);
+  transition: 0.16s linear;
+  padding: 0 5px;
+}
+
+.js-select-multiple{
+  resize: vertical;
+}
+
+.js-select:hover {
+  background-color: #cfd4d8;
+}
+
+.js-select option {
+  background-color: #fff;
+}
+
+textarea {
+  resize: vertical;
+  height: 78px;
+  border-radius: 2px;
+  border: 1px solid #c6cdd3;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  color: rgb(83, 92, 105);
+  padding: 5px;
+}
+
+.page__description__wrapper {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  margin-left: 40px;
+  width: 300px;
+  font-family: OpenSans-Light, Helvetica, Arial, sans-serif;
+  color: rgb(83, 92, 105);
+}
+
+.page__description {
+  font-size: 14px;
+  box-sizing: border-box;
+  background-color: #eef2f4;
+  padding: 15px;
+}
+
+.service__description {
+  font-size: 14px;
+  background-color: #eef2f4;
+  padding: 15px;
+  margin-bottom: 10px;
+}
+
+.column__title {
+  font-family: OpenSans-Light, Helvetica, Arial, sans-serif;
+  color: rgb(83, 92, 105);
+  font-size: 20px;
+  margin-bottom: 10px;
+}
+
+.windowContainer label {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  color: #5e6675;
+  font-size: 13px;
+  margin-bottom: 2px;
+  padding: 8px 0 4px;
+}
+
+.service__description__wrapper {
+  overflow: hidden;
+  transition: .2s ease;
+}
+
+.service__description__properties {
+  display: grid;
+  grid-template-columns: auto auto;
+  grid-column-gap: 20px;
+  margin-top: 12px;
+}
+
+.container-grid{
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  grid-gap: 20px;
+}
+
+.container-grid-field{
+  display: flex;
+  flex-direction: column;
+}
+
+.input-deadline{
+  font-family: OpenSans-Bold, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 12px;
+  height: 37px;
+  line-height: 37px;
+  text-transform: uppercase;
+  background-color: #fff;
+  border-radius: 2px;
+  border: 1px solid #c6cdd3;
+  color: #535b69;
+  transition: 0.16s linear;
+  padding: 0 5px;
+}
+
+.projectpicker-div{
+  position: relative;
+}
+
+.projectpicker-hint{
+  position: absolute;
+  top: calc(100% + 4px);
+  font-size: 10px;
+  line-height: 12px;
+  font-style: italic;
+  color: #333;
+}
