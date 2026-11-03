@@ -1381,7 +1381,7 @@ return [
                         'name' => 'field_delivery_locality',
                         'required' => true,
                         'concat_title' => true,
-                        'placeholder' => 'Например, Вологда (для названия задачи)',
+                        'placeholder' => 'Например, Вологда',
                     ],
                 ],
             ],
