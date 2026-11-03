@@ -24,6 +24,7 @@ class ServicesMain extends \CBitrixComponent implements \Bitrix\Main\Engine\Cont
 
     private const INTERNAL_CLAIM_SERVICE_IDS = [255167, 255216];
     private const INTERNAL_CLAIM_PRODUCTION_ORDER_FIELD = 'field_internal_claim_production_order';
+    private const DELIVERY_LOCALITY_FIELD = 'field_delivery_locality';
 
     public function __construct($component = null){
         parent::__construct($component);
@@ -282,6 +283,52 @@ class ServicesMain extends \CBitrixComponent implements \Bitrix\Main\Engine\Cont
         return $result;
     }
 
+    /** Населённый пункт обязателен только для услуг с этим полем в config.php. */
+    private function prepareDeliveryTask($serviceId, $description, $request): array
+    {
+        $result = ['description' => $description, 'titleText' => '', 'errors' => [], 'fieldErrors' => []];
+        $field = null;
+        foreach ($this->extraFieldsConfig['elements'] as $element) {
+            if (!in_array((int)$serviceId, array_map('intval', $element['values']), true)) {
+                continue;
+            }
+            foreach ($element['fields'] as $candidate) {
+                if ($candidate['name'] === self::DELIVERY_LOCALITY_FIELD) {
+                    $field = $candidate;
+                    break 2;
+                }
+            }
+        }
+        if ($field === null) {
+            return $result;
+        }
+
+        $value = $this->normalizeServiceFieldValue($request->getPost($field['name']));
+        if ($value === null || $value === '') {
+            $message = ($value === null ? 'Некорректное значение поля «' : 'Заполните поле «')
+                . $field['label'] . '».';
+            $result['errors'][] = $message;
+            $result['fieldErrors'][$field['name']] = $message;
+            return $result;
+        }
+        // Название задачи должно оставаться однострочным, в том числе после вставки текста.
+        $value = preg_replace('/[\s\p{Z}\x{200B}\x{FEFF}]+/u', ' ', $value);
+
+        $description = $description ?? '';
+        if ($this->normalizeServiceFieldValue($description) === null) {
+            $result['errors'][] = 'Некорректное описание заявки.';
+            return $result;
+        }
+        $line = $field['label'] . ': ' . $value;
+        if (strpos($description, $line) === false) {
+            $description = rtrim($description);
+            $description .= ($description !== '' ? "\n\n" : '') . $line;
+        }
+        $result['description'] = $description;
+        $result['titleText'] = $value;
+        return $result;
+    }
+
     /** Выполняется до загрузки файлов и создания задачи. */
     private function appendServiceRules($serviceId, $description)
     {
@@ -399,8 +446,6 @@ class ServicesMain extends \CBitrixComponent implements \Bitrix\Main\Engine\Cont
         $priority = $request->getPost("select-priority");
         $service = $request->getPost("select-service");
         $deadline = $request->getPost("input-deadline");
-        $fieldsForConcatTitle = explode(",", $request->getPost("fields-for-concat-title"));
-
         $description = $request->getPost("description");
 
         $customProject = $request->getPost("projectpickerField") ? $request->getPost($request->getPost("projectpickerField")) : false;
@@ -433,6 +478,15 @@ class ServicesMain extends \CBitrixComponent implements \Bitrix\Main\Engine\Cont
             ];
         }
         $description = $internalClaim['description'];
+
+        $delivery = $this->prepareDeliveryTask($service, $description, $request);
+        if ($delivery['errors']) {
+            return [
+                'validationErrors' => $delivery['errors'],
+                'fieldErrors' => $delivery['fieldErrors'],
+            ];
+        }
+        $description = $delivery['description'];
         $description = $this->appendServiceRules($service, $description);
 
         $fileField = $this->parseFiles($request->getFile('task_files'));
@@ -503,7 +557,12 @@ class ServicesMain extends \CBitrixComponent implements \Bitrix\Main\Engine\Cont
             $builder->setWorkGroup($customProject);
         endif;
 
-        if (!empty($fieldsForConcatTitle)) {
+        if ($delivery['titleText'] !== '') {
+            // Обязательный суффикс берётся из проверенного поля, а не из списка клиента.
+            $builder = $this->taskTitleConcat($builder, [$delivery['titleText']]);
+        } else {
+            $fieldsForConcatTitle = $request->getPost('fields-for-concat-title');
+            $fieldsForConcatTitle = is_string($fieldsForConcatTitle) ? explode(',', $fieldsForConcatTitle) : [];
             $texts = [];
 
             foreach ($fieldsForConcatTitle as $field) {
