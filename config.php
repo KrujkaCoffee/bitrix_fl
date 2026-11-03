@@ -1354,7 +1354,7 @@ return [
                         'concat_title' => true,
                     ],
                     [
-                        'label' => 'Сегмент поставщика (для нескольких вариантов используйте ctrl или shift)',
+                        'label' => 'Сегмент поставщика',
                         'type' => 'iblock_elements',
                         'name' => 'field_' . guidv4(),
                         'required' => true,
