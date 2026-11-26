@@ -14,6 +14,217 @@
     let activeFieldSchema = null;
     let unassignedDescription = '';
     const serviceDrafts = new Map();
+    const recruitmentRequests = new Map();
+    let recruitmentStateBlock = null;
+    let formRequestPending = false;
+    let submitLockedSelectors = [];
+    let lockedRecruitmentInputs = [];
+
+    const isRecruitmentSchema = schema => !!schema && schema.recruitment === true;
+
+    const recruitmentStorageKey = serviceKey => 'services.recruitment.'
+        + encodeURIComponent(servicesComponentName) + '.' + encodeURIComponent(serviceKey);
+
+    const newRecruitmentRequestKey = () => {
+        if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+        const bytes = new Uint8Array(16);
+        crypto.getRandomValues(bytes);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+        return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16),
+            hex.slice(16, 20), hex.slice(20)].join('-');
+    };
+
+    const saveRecruitmentRequest = (serviceKey, state) => {
+        // Persist only the request identifier and its lifecycle, never form fields or names.
+        recruitmentRequests.set(serviceKey, state);
+        sessionStorage.setItem(recruitmentStorageKey(serviceKey), JSON.stringify({
+            key: state.key,
+            status: state.status,
+        }));
+    };
+
+    const getRecruitmentRequest = serviceKey => {
+        if (recruitmentRequests.has(serviceKey)) return recruitmentRequests.get(serviceKey);
+        const stored = sessionStorage.getItem(recruitmentStorageKey(serviceKey));
+        if (stored) {
+            let state;
+            try {
+                state = JSON.parse(stored);
+            } catch (error) {
+                throw new Error('Не удалось прочитать идентификатор предыдущей заявки. Обратитесь к администратору.');
+            }
+            if (!state || !/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(state.key)
+                || !['DRAFT', 'SENDING', 'PENDING', 'COMPLETE', 'UNCERTAIN'].includes(state.status)) {
+                throw new Error('Не удалось определить состояние предыдущей заявки. Обратитесь к администратору.');
+            }
+            recruitmentRequests.set(serviceKey, state);
+            return state;
+        }
+        const state = {key: newRecruitmentRequestKey(), status: 'DRAFT'};
+        saveRecruitmentRequest(serviceKey, state);
+        return state;
+    };
+
+    const handleRecruitmentResult = (serviceKey, state, result) => {
+        if (!result || !['PENDING', 'COMPLETE', 'UNCERTAIN'].includes(result.recruitmentStatus)) {
+            throw new Error('Сервер не подтвердил состояние заявки.');
+        }
+        state.status = result.recruitmentStatus;
+        try {
+            saveRecruitmentRequest(serviceKey, state);
+        } catch (error) {
+            alert('Результат заявки получен, но браузер не сохранил её состояние. '
+                + 'Идентификатор заявки: ' + state.key + '. ' + error.message);
+        }
+        if (result.recruitmentStatus === 'PENDING') {
+            alert(result.recruitmentMessage || 'Задача создана. Создание вакансии ещё выполняется. '
+                + 'Откроется существующая задача, повторно отправлять заявку не требуется.');
+        } else if (result.recruitmentStatus === 'UNCERTAIN') {
+            alert((result.recruitmentMessage || 'Результат создания заявки требует проверки. '
+                + 'Обратитесь к администратору.') + '\nПовторно отправлять заявку не следует. '
+                + 'Идентификатор заявки: ' + state.key + '.');
+        }
+        if (/^[1-9]\d*$/.test(String(result.userId)) && /^[1-9]\d*$/.test(String(result.taskId))) {
+            location.href = `/company/personal/user/${result.userId}/tasks/task/view/${result.taskId}/`;
+        }
+    };
+
+    const checkRecruitmentStatus = async (serviceKey, state) => {
+        if (formRequestPending) return;
+        formRequestPending = true;
+        updateRecruitmentState();
+        try {
+            const data = new FormData();
+            data.set('select-service', serviceKey);
+            data.set('recruitment_request_key', state.key);
+            const response = await BX.ajax.runComponentAction(servicesComponentName, 'recruitmentStatus', {
+                mode: 'class', data,
+            });
+            const result = response && response.data;
+            if (showServerValidation(result)) return;
+            if (result && result.recruitmentStatus === 'NOT_FOUND') {
+                state.status = 'DRAFT';
+                saveRecruitmentRequest(serviceKey, state);
+                alert(result.recruitmentMessage || 'Отправка не зарегистрирована. Можно проверить поля и отправить заявку.');
+            } else {
+                handleRecruitmentResult(serviceKey, state, result);
+            }
+        } catch (error) {
+            const messages = error && Array.isArray(error.errors)
+                ? error.errors.map(item => item.message).filter(Boolean) : [];
+            alert((messages.length ? messages.join('\n') : 'Не удалось проверить отправку. Повторите проверку позже.')
+                + '\nИдентификатор заявки: ' + state.key + '.');
+        } finally {
+            formRequestPending = false;
+            updateRecruitmentState();
+        }
+    };
+
+    const updateRecruitmentState = () => {
+        const form = document.querySelector('#service-form');
+        if (!form) return;
+        if (!recruitmentStateBlock) {
+            recruitmentStateBlock = createRulesElement('div', 'service-requirements__request-state');
+            recruitmentStateBlock.setAttribute('aria-live', 'polite');
+            form.querySelector('[type="submit"]').insertAdjacentElement('beforebegin', recruitmentStateBlock);
+        }
+        recruitmentStateBlock.textContent = '';
+        recruitmentStateBlock.hidden = true;
+        let blocked = false;
+        if (isRecruitmentSchema(activeFieldSchema)) {
+            try {
+                const state = getRecruitmentRequest(activeServiceKey);
+                blocked = state.status !== 'DRAFT';
+                if (blocked) {
+                    let message = 'Эта заявка уже отправлена. Для отдельной вакансии нажмите «Новая заявка».';
+                    if (state.status === 'SENDING') {
+                        message = formRequestPending ? 'Выполняется отправка или проверка заявки.'
+                            : 'Подтверждение отправки не получено. Нажмите «Проверить отправку», '
+                                + 'чтобы узнать результат и продолжить работу с заявкой.';
+                    } else if (state.status === 'UNCERTAIN') {
+                        message = 'Результат создания заявки требует проверки. Повторная отправка заблокирована. '
+                            + 'Обратитесь к администратору и сообщите идентификатор ' + state.key + '.';
+                    }
+                    recruitmentStateBlock.appendChild(createRulesElement('p', '', message));
+                    if (state.status === 'SENDING' || state.status === 'UNCERTAIN') {
+                        const checkButton = createRulesElement('button', 'ui-btn ui-btn-light-border', 'Проверить отправку');
+                        checkButton.type = 'button';
+                        checkButton.disabled = formRequestPending;
+                        const serviceKey = activeServiceKey;
+                        checkButton.addEventListener('click', () => checkRecruitmentStatus(serviceKey, state));
+                        recruitmentStateBlock.appendChild(checkButton);
+                    } else if (state.status !== 'UNCERTAIN') {
+                        const newDraftButton = createRulesElement('button', 'ui-btn ui-btn-light-border', 'Новая заявка');
+                        newDraftButton.type = 'button';
+                        newDraftButton.disabled = formRequestPending;
+                        newDraftButton.addEventListener('click', () => {
+                            if (formRequestPending) return;
+                            try {
+                                saveRecruitmentRequest(activeServiceKey, {
+                                    key: newRecruitmentRequestKey(), status: 'DRAFT',
+                                });
+                                serviceDrafts.delete(activeServiceKey);
+                                requirementControls.forEach(control => {
+                                    if (control.element.setServiceValue) control.element.setServiceValue('', '');
+                                    else control.input.value = '';
+                                    clearRequirementError(control);
+                                });
+                                descriptionField.value = '';
+                                const files = form.querySelector('#task-files');
+                                const filesCounter = form.querySelector('#task-files-counter');
+                                if (files) files.value = '';
+                                if (filesCounter) filesCounter.textContent = '[0]';
+                                updateRequirementVisibility();
+                                updateRecruitmentState();
+                            } catch (error) {
+                                alert('Не удалось подготовить новую заявку. ' + error.message);
+                            }
+                        });
+                        recruitmentStateBlock.appendChild(newDraftButton);
+                    }
+                    recruitmentStateBlock.hidden = false;
+                }
+            } catch (error) {
+                blocked = true;
+                recruitmentStateBlock.textContent = 'Не удалось сохранить состояние заявки в браузере. '
+                    + 'Проверьте доступность хранилища браузера. ' + error.message;
+                recruitmentStateBlock.hidden = false;
+            }
+        }
+        form.querySelectorAll('[type="submit"]').forEach(button => {
+            button.disabled = formRequestPending || blocked;
+        });
+        const serviceSelect = form.querySelector('#select-service');
+        if (formRequestPending && !submitLockedSelectors.length) {
+            submitLockedSelectors = [...responsibleSelects, serviceSelect].filter(Boolean)
+                .map(select => ({select, disabled: select.disabled}));
+            submitLockedSelectors.forEach(({select}) => { select.disabled = true; });
+        } else if (!formRequestPending && submitLockedSelectors.length) {
+            submitLockedSelectors.forEach(({select, disabled}) => { select.disabled = disabled; });
+            submitLockedSelectors = [];
+        }
+        lockedRecruitmentInputs.forEach(({input, disabled}) => { input.disabled = disabled; });
+        lockedRecruitmentInputs = [];
+        requirementControls.forEach(control => {
+            if (control.element.setServiceDisabled) control.element.setServiceDisabled(control.input.disabled);
+        });
+        if (isRecruitmentSchema(activeFieldSchema) && (blocked || formRequestPending)) {
+            const inputs = new Set([descriptionField, form.querySelector('#task-files')]);
+            requirementControls.forEach(control => {
+                inputs.add(control.input);
+                inputs.add(control.focusInput);
+                control.element.querySelectorAll('button').forEach(button => inputs.add(button));
+            });
+            lockedRecruitmentInputs = Array.from(inputs).filter(Boolean)
+                .map(input => ({input, disabled: input.disabled}));
+            lockedRecruitmentInputs.forEach(({input}) => { input.disabled = true; });
+            requirementControls.forEach(control => {
+                if (control.element.setServiceDisabled) control.element.setServiceDisabled(true);
+            });
+        }
+    };
 
     let marketingLogic = 0;
 
@@ -162,6 +373,7 @@
         control.error.textContent = '';
         control.error.hidden = true;
         control.input.removeAttribute('aria-invalid');
+        control.focusInput.removeAttribute('aria-invalid');
         control.input.setCustomValidity('');
     };
 
@@ -169,15 +381,32 @@
         let first = null;
         Object.entries(errors).forEach(([name, message]) => {
             const control = requirementControls.get(name);
-            if (!control || control.input.disabled) return;
+            if (!control || control.wrapper.hidden) return;
             control.error.textContent = message;
             control.error.hidden = false;
             control.input.setAttribute('aria-invalid', 'true');
+            control.focusInput.setAttribute('aria-invalid', 'true');
             control.input.setCustomValidity(message);
-            if (!first) first = control.input;
+            if (!first) first = control.focusInput;
         });
         if (first) first.focus();
         return !!first;
+    };
+
+    const showServerValidation = payload => {
+        if (!payload || typeof payload !== 'object') return false;
+        const fieldErrors = payload.fieldErrors && typeof payload.fieldErrors === 'object'
+            ? payload.fieldErrors : {};
+        const messages = Array.isArray(payload.validationErrors) ? payload.validationErrors : [];
+        if (!messages.length && !Object.keys(fieldErrors).length) return false;
+        showRequirementErrors(fieldErrors);
+        const visibleMessages = Object.entries(fieldErrors)
+            .filter(([name]) => requirementControls.has(name) && !requirementControls.get(name).wrapper.hidden)
+            .map(([, message]) => message);
+        const remainingMessages = [...messages, ...Object.values(fieldErrors)]
+            .filter(message => typeof message === 'string' && !visibleMessages.includes(message));
+        if (remainingMessages.length) alert(Array.from(new Set(remainingMessages)).join('\n'));
+        return true;
     };
 
     const updateRequirementVisibility = () => {
@@ -187,8 +416,11 @@
             const visible = !condition || normalizedFieldValue(values[condition.field]) === String(condition.equals);
             control.wrapper.hidden = !visible;
             control.input.disabled = !visible;
+            if (control.focusInput !== control.input) control.focusInput.disabled = !visible;
+            if (control.element.setServiceDisabled) control.element.setServiceDisabled(!visible);
             control.input.required = visible && !!control.field.required;
             control.input.setAttribute('aria-required', control.input.required ? 'true' : 'false');
+            control.focusInput.setAttribute('aria-required', control.input.required ? 'true' : 'false');
             if (!visible) clearRequirementError(control);
         });
     };
@@ -203,12 +435,24 @@
                 errors[field.name] = 'Заполните поле «' + field.label + '».';
             } else if (value && field.type === 'list' && !field.values.some(item => item.value === value)) {
                 errors[field.name] = 'Выберите допустимое значение поля «' + field.label + '».';
+            } else if (value && field.type === 'employee' && !/^[1-9]\d*$/.test(value)) {
+                errors[field.name] = 'Выберите сотрудника в поле «' + field.label + '».';
+            } else if (value && field.type === 'integer') {
+                const number = Number(value);
+                if (!/^-?\d+$/.test(value) || !Number.isSafeInteger(number)
+                    || (field.min !== undefined && number < Number(field.min))
+                    || (field.max !== undefined && number > Number(field.max))) {
+                    errors[field.name] = 'Укажите допустимое целое число в поле «' + field.label + '».';
+                }
             }
         });
         return errors;
     };
 
-    const renderRequirementFields = (schema, createField, savedValues = {}) => {
+    const renderRequirementFields = (schema, createField, savedValues = {}, savedLabels = {}) => {
+        requirementControls.forEach(control => {
+            if (control.element.destroyServiceField) control.element.destroyServiceField();
+        });
         requirementControls.clear();
         if (requirementFieldsBlock) {
             requirementFieldsBlock.textContent = '';
@@ -220,17 +464,26 @@
             const anchor = document.querySelector('#service-form label[for="description"]') || descriptionField;
             anchor.insertAdjacentElement('beforebegin', requirementFieldsBlock);
         }
-        requirementFieldsBlock.appendChild(createRulesElement('legend', '', 'Сведения по заявке'));
-        requirementFieldsBlock.appendChild(createRulesElement('p', 'service-requirements__intro', 'Поля со звёздочкой обязательны.'));
+        requirementFieldsBlock.appendChild(createRulesElement('legend', '', schema.title || 'Сведения по заявке'));
+        requirementFieldsBlock.appendChild(createRulesElement('p', 'service-requirements__intro',
+            schema.intro || 'Поля со звёздочкой обязательны.'));
         const grid = createRulesElement('div', 'service-requirements__grid');
         schema.fields.forEach(field => {
             const wrapper = createRulesElement('div', 'service-requirements__field');
             if (field.layout === 'wide') wrapper.classList.add('service-requirements__field--wide');
             const label = createRulesElement('label', '', field.label + (field.required ? ' *' : ''));
-            label.htmlFor = field.name;
-            const input = createField(field);
-            if (!input) throw new Error('Неподдерживаемый тип поля: ' + field.type);
-            input.value = Object.prototype.hasOwnProperty.call(savedValues, field.name) ? savedValues[field.name] : '';
+            const element = createField(field);
+            if (!element) throw new Error('Неподдерживаемый тип поля: ' + field.type);
+            const input = element.serviceCanonicalInput || element;
+            const focusInput = element.serviceFocusInput || input;
+            label.htmlFor = focusInput.id;
+            const value = Object.prototype.hasOwnProperty.call(savedValues, field.name)
+                ? savedValues[field.name] : (field.defaultValue ?? field.value ?? '');
+            if (element.setServiceValue) {
+                element.setServiceValue(value, savedLabels[field.name] || field.userLabel || '');
+            } else {
+                input.value = value;
+            }
             const hint = createRulesElement('p', 'service-requirements__hint', field.hint || '');
             hint.id = field.name + '_hint';
             hint.hidden = !field.hint;
@@ -239,9 +492,10 @@
             error.hidden = true;
             error.setAttribute('aria-live', 'polite');
             input.setAttribute('aria-describedby', [hint.id, error.id].join(' '));
-            wrapper.append(label, input, hint, error);
+            focusInput.setAttribute('aria-describedby', [hint.id, error.id].join(' '));
+            wrapper.append(label, element, hint, error);
             grid.appendChild(wrapper);
-            const control = {field, input, wrapper, error};
+            const control = {field, input, focusInput, element, wrapper, error};
             requirementControls.set(field.name, control);
             const onEdit = () => { clearRequirementError(control); updateRequirementVisibility(); };
             input.addEventListener('input', onEdit);
@@ -265,6 +519,9 @@
             serviceDrafts.set(activeServiceKey, {
                 description: descriptionField.value,
                 fields: currentRequirementValues(),
+                labels: Object.fromEntries(Array.from(requirementControls.entries())
+                    .filter(([, control]) => control.element.getServiceLabel)
+                    .map(([name, control]) => [name, control.element.getServiceLabel()])),
             });
         } else {
             unassignedDescription = descriptionField.value;
@@ -274,7 +531,7 @@
     const selectServiceForm = (service, createField) => {
         saveServiceDraft();
         activeServiceKey = String(service.value);
-        activeFieldSchema = service.hasServiceRules && service.fieldSchema
+        activeFieldSchema = service.fieldSchema
             && Array.isArray(service.fieldSchema.fields) ? service.fieldSchema : null;
         const draft = serviceDrafts.get(activeServiceKey);
         if (draft) {
@@ -283,7 +540,8 @@
             descriptionField.value = [service.startText || '', unassignedDescription]
                 .filter(text => String(text).trim()).join('\n\n');
         }
-        renderRequirementFields(activeFieldSchema, createField, draft ? draft.fields : {});
+        renderRequirementFields(activeFieldSchema, createField, draft ? draft.fields : {}, draft ? draft.labels : {});
+        updateRecruitmentState();
     };
 
     const resetServiceForm = () => {
@@ -292,6 +550,7 @@
         activeFieldSchema = null;
         renderRequirementFields(null);
         if (descriptionField) descriptionField.value = unassignedDescription;
+        updateRecruitmentState();
     };
 
     let createResponsibleBlock = (departments, depth) => {
@@ -492,6 +751,103 @@
                     input.id = field.name;
                     input.rows = field.rows || 3;
                     break;
+                case 'integer':
+                    input = buildInput(field.name, field.name);
+                    input.type = 'number';
+                    input.step = '1';
+                    input.inputMode = 'numeric';
+                    if (field.min !== undefined) input.min = field.min;
+                    if (field.max !== undefined) input.max = field.max;
+                    break;
+                case 'employee': {
+                    const container = buildDiv('service-field-employee');
+                    const canonical = buildInput(field.name, field.name);
+                    canonical.type = 'hidden';
+                    const selectButton = createRulesElement('button', 'ui-btn ui-btn-light-border', 'Выбрать сотрудника');
+                    selectButton.type = 'button';
+                    selectButton.id = field.name + '_select';
+                    const clearButton = createRulesElement('button', 'ui-btn ui-btn-link', 'Очистить');
+                    clearButton.type = 'button';
+                    clearButton.hidden = true;
+                    let selectedLabel = '';
+                    let dialog = null;
+
+                    const setValue = (value, title) => {
+                        canonical.value = value ? String(value) : '';
+                        selectedLabel = title || '';
+                        selectButton.textContent = canonical.value
+                            ? (selectedLabel || 'Загрузка имени сотрудника…') : 'Выбрать сотрудника';
+                        clearButton.hidden = !canonical.value;
+                    };
+                    const createDialog = () => {
+                        const knownSelection = canonical.value && selectedLabel
+                            ? [{id: Number(canonical.value), entityId: 'user', title: selectedLabel}] : [];
+                        dialog = new BX.UI.EntitySelector.Dialog({
+                            targetNode: selectButton,
+                            context: 'services.main.recruitment',
+                            multiple: false,
+                            enableSearch: true,
+                            hideOnSelect: true,
+                            entities: [{id: 'user', options: {intranetUsersOnly: true, inviteEmployeeLink: false}}],
+                            selectedItems: knownSelection,
+                            preselectedItems: canonical.value && !selectedLabel
+                                ? [['user', Number(canonical.value)]] : [],
+                            events: {
+                                'Item:onSelect': event => {
+                                    const item = event.getData().item;
+                                    setValue(item.getId(), item.getTitle());
+                                    canonical.dispatchEvent(new Event('change', {bubbles: true}));
+                                },
+                                'Item:onDeselect': event => {
+                                    if (String(event.getData().item.getId()) === canonical.value) {
+                                        setValue('', '');
+                                        canonical.dispatchEvent(new Event('change', {bubbles: true}));
+                                    }
+                                },
+                                onLoad: event => {
+                                    const selected = event.getTarget().getSelectedItems()
+                                        .find(item => String(item.getId()) === canonical.value);
+                                    if (selected) setValue(selected.getId(), selected.getTitle());
+                                    else if (canonical.value && !selectedLabel) {
+                                        selectButton.textContent = 'Выберите сотрудника повторно';
+                                    }
+                                },
+                                onLoadError: () => {
+                                    selectButton.textContent = selectedLabel || 'Выбрать сотрудника';
+                                    alert('Не удалось загрузить список сотрудников. Откройте выбор сотрудника ещё раз.');
+                                },
+                            },
+                        });
+                    };
+                    selectButton.addEventListener('click', () => {
+                        if (!dialog) createDialog();
+                        dialog.show();
+                    });
+                    clearButton.addEventListener('click', () => {
+                        if (dialog) dialog.deselectAll();
+                        setValue('', '');
+                        canonical.dispatchEvent(new Event('change', {bubbles: true}));
+                    });
+                    container.serviceCanonicalInput = canonical;
+                    container.serviceFocusInput = selectButton;
+                    container.setServiceValue = (value, title) => {
+                        if (dialog) dialog.destroy();
+                        dialog = null;
+                        setValue(value, title);
+                        if (canonical.value && !selectedLabel) createDialog();
+                    };
+                    container.getServiceLabel = () => selectedLabel;
+                    container.setServiceDisabled = disabled => {
+                        clearButton.disabled = disabled;
+                        if (disabled && dialog) dialog.hide();
+                    };
+                    container.destroyServiceField = () => {
+                        if (dialog) dialog.destroy();
+                    };
+                    container.append(canonical, selectButton, clearButton);
+                    input = container;
+                    break;
+                }
                 case 'list':
                     input = buildSelect(field.values, field.name);
                     break;
@@ -755,6 +1111,7 @@
         if ( form ){
             form.addEventListener('submit', async e => {
                 e.preventDefault();
+                if (isAjax) return;
                 let department = form.querySelector('#select-department');
                 let priority = form.querySelector('#select-priority');
                 let service = form.querySelector('#select-service');
@@ -808,61 +1165,111 @@
                     return false;
                 }
 
-                if ( isAjax ) return;
+                const submittedServiceKey = activeServiceKey;
+                const submittedSchema = activeFieldSchema;
+                const recruitment = isRecruitmentSchema(submittedSchema);
+                let recruitmentRequest = null;
+                if (recruitment) {
+                    try {
+                        recruitmentRequest = getRecruitmentRequest(submittedServiceKey);
+                        if (recruitmentRequest.status !== 'DRAFT') {
+                            updateRecruitmentState();
+                            alert('Эта заявка уже отправлена. Проверьте сообщение под формой.');
+                            return;
+                        }
+                        // Verify persistence before any task can be created.
+                        saveRecruitmentRequest(submittedServiceKey, recruitmentRequest);
+                    } catch (error) {
+                        alert('Не удалось подготовить отправку заявки. ' + error.message);
+                        return;
+                    }
+                }
                 isAjax = true;
 
-                let extraDescription = '';
-                extraFieldsMap.forEach(field => {
-                    let fieldForm = form.querySelector('#' + field.id);
-                    if ( fieldForm && !fieldsForConcatTitle.includes(field.id) ){
-                        if ( fieldForm.tagName === 'SELECT' && fieldForm.multiple ){
-                            extraDescription += field.label + ": " + Array.from(fieldForm.options).filter(o => o.selected).map(o => o.value).join('; ') + "\n\n";
-
-                        }else{
-                            extraDescription += field.label + ": " + fieldForm.value + "\n\n";
-                        }
-                    }
-                });
-
-                let data = new FormData(form);
-                data.set('description', activeFieldSchema ? description.value
-                    : description.value + (extraDescription ? '\n\n' + extraDescription : ''));
-                data.set('extra_fields_description', extraDescription);
-                if (activeFieldSchema) data.set('service_fields_version', activeFieldSchema.version);
-
-                extraFieldsMap.forEach(field => {
-                    let fieldForm = form.querySelector('#' + field.id);
-                    if ( fieldForm ){
-                        if ( field.type === 'projectpicker' ){
-                            data.set('projectpickerField', field.id)
-                        }
-                    }
-                });
-
-                data.set('fields-for-concat-title', fieldsForConcatTitle)
-
                 try {
+                    let extraDescription = '';
+                    extraFieldsMap.forEach(field => {
+                        let fieldForm = form.querySelector('#' + field.id);
+                        if ( fieldForm && !fieldsForConcatTitle.includes(field.id) ){
+                            if ( fieldForm.tagName === 'SELECT' && fieldForm.multiple ){
+                                extraDescription += field.label + ": " + Array.from(fieldForm.options).filter(o => o.selected).map(o => o.value).join('; ') + "\n\n";
+
+                            }else{
+                                extraDescription += field.label + ": " + fieldForm.value + "\n\n";
+                            }
+                        }
+                    });
+
+                    let data = new FormData(form);
+                    data.set('description', submittedSchema ? description.value
+                        : description.value + (extraDescription ? '\n\n' + extraDescription : ''));
+                    data.set('extra_fields_description', extraDescription);
+                    if (submittedSchema) data.set('service_fields_version', submittedSchema.version);
+                    if (recruitment) data.set('recruitment_request_key', recruitmentRequest.key);
+
+                    extraFieldsMap.forEach(field => {
+                        let fieldForm = form.querySelector('#' + field.id);
+                        if ( fieldForm ){
+                            if ( field.type === 'projectpicker' ){
+                                data.set('projectpickerField', field.id)
+                            }
+                        }
+                    });
+
+                    data.set('fields-for-concat-title', fieldsForConcatTitle)
+
+                    if (recruitment) {
+                        recruitmentRequest.status = 'SENDING';
+                        saveRecruitmentRequest(submittedServiceKey, recruitmentRequest);
+                    }
+                    formRequestPending = true;
+                    updateRecruitmentState();
                     let response = await BX.ajax.runComponentAction(servicesComponentName, 'send', {
                         mode: 'class',
                         data: data,
                     });
 
-                    if (Array.isArray(response.data.validationErrors) && response.data.validationErrors.length) {
-                        if (!showRequirementErrors(response.data.fieldErrors || {})) {
-                            alert(response.data.validationErrors.join('\n'));
+                    const result = response && response.data;
+                    if (showServerValidation(result)) {
+                        if (recruitment) {
+                            recruitmentRequest.status = 'DRAFT';
+                            saveRecruitmentRequest(submittedServiceKey, recruitmentRequest);
                         }
+                        return;
                     }
 
-                    if ( response.data.userId && response.data.taskId ){
-                        location.href = `/company/personal/user/${response.data.userId}/tasks/task/view/${response.data.taskId}/`;
+                    if (recruitment) {
+                        handleRecruitmentResult(submittedServiceKey, recruitmentRequest, result);
+                    } else if (result && /^[1-9]\d*$/.test(String(result.userId))
+                        && /^[1-9]\d*$/.test(String(result.taskId))) {
+                        location.href = `/company/personal/user/${result.userId}/tasks/task/view/${result.taskId}/`;
+                    } else {
+                        alert('Сервер не вернул номер созданной задачи. Обратитесь к администратору.');
                     }
 
                 } catch(err) {
-                    alert('Произошла неожиданная ошибка! Пожалуйста, попробуйте позже!');
+                    if (showServerValidation(err && err.data)) {
+                        if (recruitment) {
+                            recruitmentRequest.status = 'DRAFT';
+                            try {
+                                saveRecruitmentRequest(submittedServiceKey, recruitmentRequest);
+                            } catch (error) {
+                                alert('Не удалось сохранить состояние черновика. ' + error.message);
+                            }
+                        }
+                    } else {
+                        const messages = err && Array.isArray(err.errors)
+                            ? err.errors.map(error => error.message).filter(Boolean) : [];
+                        const message = messages.length ? messages.join('\n')
+                            : 'Не удалось получить подтверждение отправки. Проверьте соединение.';
+                        alert(message + (recruitment ? '\nНажмите «Проверить отправку», чтобы узнать результат '
+                            + 'перед продолжением работы с заявкой.' : ''));
+                    }
+                } finally {
+                    isAjax = false;
+                    formRequestPending = false;
+                    updateRecruitmentState();
                 }
-
-
-                isAjax = false;
             });
 
         }
