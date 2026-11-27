@@ -158,6 +158,10 @@ class ServicesMain extends \CBitrixComponent implements \Bitrix\Main\Engine\Cont
 
     private function getServiceFieldSchema($serviceId): array
     {
+        $recruitment = $this->recruitmentForm();
+        if ($recruitment->applies($serviceId)) {
+            return $recruitment->clientSchema();
+        }
         if (!$this->serviceRuleApplies($serviceId)) {
             return [];
         }
@@ -442,6 +446,15 @@ class ServicesMain extends \CBitrixComponent implements \Bitrix\Main\Engine\Cont
     public function sendAction() : array{
         $request = Bitrix\Main\Application::getInstance()->getContext()->getRequest();
 
+        $recruitment = $this->recruitmentForm();
+        if ($recruitment->applies($request->getPost('select-service'))) {
+            return $this->sendRecruitment($request, $recruitment);
+        }
+        // A stale pilot page must never fall through and create an ordinary duplicate task.
+        if ($request->getPost('recruitment_request_key') !== null) {
+            return ['validationErrors' => ['Пилот подбора сейчас недоступен для этой формы. Проверьте результат ранее отправленной заявки.'], 'fieldErrors' => []];
+        }
+
         $department = $request->getPost("select-department");
         $priority = $request->getPost("select-priority");
         $service = $request->getPost("select-service");
@@ -582,6 +595,147 @@ class ServicesMain extends \CBitrixComponent implements \Bitrix\Main\Engine\Cont
             'userId' => $userId,
             'taskId' => $taskId
         ];
+    }
+
+    private function recruitmentForm(): \Kelast\Recruitment\Form
+    {
+        require_once __DIR__ . '/recruitment/bootstrap.php';
+        return new \Kelast\Recruitment\Form(require __DIR__ . '/recruitment/config.php');
+    }
+
+    /** Pilot is scoped to one service and an explicit list of authenticated users. */
+    private function sendRecruitment($request, \Kelast\Recruitment\Form $form): array
+    {
+        $actor = (int)\Bitrix\Main\Engine\CurrentUser::get()->getId();
+        $config = require __DIR__ . '/recruitment/config.php';
+        $prepared = $form->prepare($request, $actor);
+        if ($prepared['errors']) {
+            return ['validationErrors' => $prepared['errors'], 'fieldErrors' => $prepared['fieldErrors']];
+        }
+        $priority = $request->getPost('select-priority');
+        $deadlineText = $request->getPost('input-deadline');
+        $deadline = is_string($deadlineText) ? \DateTime::createFromFormat('!d.m.Y H:i', $deadlineText) : false;
+        if (!in_array($priority, ['95', '96', '97'], true) || !$deadline
+            || $deadline->format('d.m.Y H:i') !== $deadlineText) {
+            return ['validationErrors' => ['Проверьте приоритет и крайний срок задачи.'], 'fieldErrors' => []];
+        }
+        $token = $request->getPost('recruitment_request_key');
+        if (!is_string($token) || !preg_match('/^[a-f0-9-]{32,64}$/Di', $token)) {
+            return ['validationErrors' => ['Не удалось определить ключ заявки. Сохраните сведения и обновите форму.'], 'fieldErrors' => []];
+        }
+        $serviceId = $config['service_id'];
+        $service = \CIBlockElement::GetList([], ['ID' => $serviceId,
+            'IBLOCK_ID' => $config['service_iblock_id'], 'ACTIVE' => 'Y'],
+            false, ['nTopCount' => 1], ['ID', 'IBLOCK_SECTION_ID'])->Fetch();
+        if (!$service || $actor <= 0) {
+            throw new \RuntimeException('Услуга подбора недоступна.');
+        }
+
+        $files = $this->recruitmentFiles($request->getFile('task_files'));
+        $fileHashes = [];
+        foreach ($files as $file) {
+            $fileHashes[] = ['name' => $file['name'], 'size' => $file['size'], 'sha256' => hash_file('sha256', $file['tmp_name'])];
+        }
+        $fingerprintValues = $prepared['values'];
+        unset($fingerprintValues['hr_request_date'], $fingerprintValues['hr_department']);
+        $fingerprint = hash('sha256', json_encode([$fingerprintValues, $prepared['inputDescription'],
+            $priority, $deadlineText, $fileHashes], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
+        $builder = new TaskServiceBuilder($serviceId);
+        $responsible = (int)$builder->getResponsible();
+        $builder->setDepartment($prepared['values']['hr_department_id'])
+            ->setPriority($priority)->setDeadLine($deadline)
+            ->setDepartmentService($service['IBLOCK_SECTION_ID'])
+            ->setDescription($prepared['description'])->setCreatedBy($actor)
+            // Recruitment details must not inherit the builder's shared IT workgroup 20.
+            ->setWorkGroup(0);
+        $builder->setTitle(mb_substr($builder->getTitle() . '_' . $prepared['values']['hr_vacancy_title'], 0, 255, 'UTF-8'));
+        $workflow = new \Kelast\Recruitment\Workflow(new \Kelast\Recruitment\RequestStore(),
+            new \Kelast\Recruitment\CrmGateway($config));
+        return $workflow->submit($token, $actor, $responsible, $prepared['values'],
+            $prepared['description'], $fingerprint, function () use ($builder, $files, $actor) {
+                // Upload only while holding the request lock, into the submitter's personal Disk.
+                $uploadedFiles = [];
+                try {
+                    if ($files) {
+                        if (!\Bitrix\Main\Loader::includeModule('disk')) {
+                            throw new \RuntimeException('Не удалось подключить Диск.');
+                        }
+                        $storage = \Bitrix\Disk\Driver::getInstance()->getStorageByUserId($actor);
+                        $folder = $storage ? $storage->getRootObject() : null;
+                        if (!$folder || !$folder->canAdd($storage->getSecurityContext($actor))) {
+                            throw new \RuntimeException('Нет доступа к личному Диску для вложений заявки.');
+                        }
+                        foreach ($files as $file) {
+                            $uploaded = $folder->uploadFile($file, ['CREATED_BY' => $actor,
+                                'NAME' => 'Заявка на подбор ' . bin2hex(random_bytes(6)) . ' ' . basename($file['name'])]);
+                            if (!$uploaded) {
+                                throw new \RuntimeException('Не удалось сохранить вложение заявки.');
+                            }
+                            $uploadedFiles[] = $uploaded;
+                            $builder->addFile($uploaded->getId());
+                        }
+                    }
+                } catch (\Throwable $error) {
+                    foreach ($uploadedFiles as $uploaded) {
+                        try {
+                            $uploaded->delete($actor);
+                        } catch (\Throwable $cleanupError) {
+                            // Only newly uploaded objects are touched. Never delete task/user files.
+                        }
+                    }
+                    throw new \Kelast\Recruitment\BeforeTaskCreationException(
+                        'Не удалось подготовить вложения на личном Диске. Задача не создавалась. Проверьте доступ к Диску и повторите отправку.');
+                }
+                try {
+                    $builder->build();
+                } catch (\Throwable $error) {
+                    if ((int)$builder->getTaskId() <= 0) {
+                        throw $error;
+                    }
+                    // The task may exist even if updating service rotation/checklists failed.
+                }
+                return (int)$builder->getTaskId();
+            });
+    }
+
+    public function recruitmentStatusAction(): array
+    {
+        $request = \Bitrix\Main\Application::getInstance()->getContext()->getRequest();
+        $form = $this->recruitmentForm();
+        $token = $request->getPost('recruitment_request_key');
+        if (!$form->applies($request->getPost('select-service')) || !is_string($token)) {
+            throw new \RuntimeException('Проверка заявки недоступна.');
+        }
+        $config = require __DIR__ . '/recruitment/config.php';
+        $workflow = new \Kelast\Recruitment\Workflow(new \Kelast\Recruitment\RequestStore(),
+            new \Kelast\Recruitment\CrmGateway($config));
+        return $workflow->status($token, (int)\Bitrix\Main\Engine\CurrentUser::get()->getId());
+    }
+
+    private function recruitmentFiles($uploaded): array
+    {
+        if ($uploaded === null || $uploaded === false) {
+            return [];
+        }
+        if (!is_array($uploaded) || !isset($uploaded['name']) || !is_array($uploaded['name'])
+            || count($uploaded['name']) > 20) {
+            throw new \RuntimeException('Некорректный набор вложений заявки.');
+        }
+        $files = [];
+        foreach ($uploaded['name'] as $index => $name) {
+            $error = $uploaded['error'][$index] ?? UPLOAD_ERR_NO_FILE;
+            if ($error === UPLOAD_ERR_NO_FILE) {
+                continue;
+            }
+            $tmp = $uploaded['tmp_name'][$index] ?? null;
+            if ($error !== UPLOAD_ERR_OK || !is_string($name) || !is_string($tmp)
+                || !is_uploaded_file($tmp) || filesize($tmp) > 10000000) {
+                throw new \RuntimeException('Не удалось принять вложение. Допустимый размер файла — до 10 МБ.');
+            }
+            $files[] = ['name' => $name, 'tmp_name' => $tmp, 'error' => UPLOAD_ERR_OK,
+                'size' => filesize($tmp), 'type' => 'application/octet-stream'];
+        }
+        return $files;
     }
 
     public function selectAction( int $department = 0 ) : array{
